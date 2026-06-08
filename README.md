@@ -119,14 +119,41 @@ negative control):
   *Invisible to a decode→encode roundtrip — caught only because the encoder gate
   feeds the saturation boundary directly.*
 
+## Upstream design observations (original VHDL, faithfully reproduced)
+
+While building an independent oracle, two properties of the **original VHDL**
+surfaced. The SystemVerilog was confirmed byte-faithful to the VHDL in both
+places, so these are reproduced as-is, not "fixed" (fixing would mean diverging
+from the reference). They are flagged here for the codec authors:
+
+1. **Sub-minimal underflow flush (N where c=-255 is unreachable, e.g. N=12).**
+   The postencoder's underflow guard fires only for `characteristic = -255 AND
+   crop = 0`. A sub-minimal input with `c = -255` and a non-zero crop bit
+   (e.g. mantissa `1000000` at N=12, value ℓ=-254.5) is therefore flushed to
+   `0x000` / `0x800` (zero / NaR) rather than rounded up to the minimum
+   magnitude. An independent nearest-value reference rounds it to `0x001` /
+   `0x801`. Affects only characteristics no decoder produces (reachable only
+   from upstream arithmetic). The oracle self-test allow-lists exactly this set.
+
+2. **Linear decode→encode is not an inverse for positive inputs.** The
+   predecoder's exponent output is `e = -c-1` for all inputs, but
+   `encoder_linear` re-inverts (`characteristic = ~e`) only for `sign = 1`. So
+   `encoder_linear(decoder_linear(t)) == t` holds for negative `t` but, for
+   positive `t`, re-encodes `~c` instead of `c`. The **logarithmic** pair
+   (`decoder_logarithmic`/`encoder_logarithmic`) is a true inverse for all
+   inputs and is the pair the original repository's own testbench exercises.
+
 ## Verified results
 
 | Check | Result |
 |-------|--------|
-| oracle self-test (anchors + roundtrip) | **PASS** |
-| `predecoder` vs oracle, N = 8 / 12 / 16 | **256 / 4096 / 65536 vectors, 0 mismatches** |
-| `postencoder` vs oracle, N = 8 / 12 / 16 | **264 / 4104 / 65544 vectors, 0 mismatches** (incl. saturation boundary) |
-| negative control (reintroduce either bug) | **gate FAILS** as expected |
+| oracle self-test (anchors + roundtrip + bit-vs-value triangulation) | **PASS** |
+| `predecoder` OE=0 (characteristic) vs oracle, N = 8 / 12 / 16 | **256 / 4096 / 65536, 0 mismatches** |
+| `predecoder` OE=1 (exponent) vs oracle, N = 8 / 12 / 16 | **256 / 4096 / 65536, 0 mismatches** |
+| `postencoder` roundtrip + boundary vs oracle, N = 8 / 12 / 16 | **264 / 4104 / 65544, 0 mismatches** |
+| `postencoder` full (s,c,m) sweep vs oracle, N = 8 / 12 | **8160 / 130560, 0 mismatches** |
+| codec wrappers (log identity + linear faithful), N = 8 / 12 / 16 | **256 / 4096 / 65536, 0 mismatches** |
+| negative control (reintroduce either conversion bug) | **gate FAILS** as expected |
 
 ## License
 

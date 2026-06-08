@@ -17,7 +17,8 @@
 `timescale 1ns / 1ps
 
 module predecoder_tb #(
-    parameter int N = 16
+    parameter int N  = 16,
+    parameter bit OE = 1'b0    // OUTPUT_EXPONENT: 0 = characteristic, 1 = exponent
 );
 
     logic [N-1:0]           takum;
@@ -30,7 +31,7 @@ module predecoder_tb #(
 
     predecoder #(
         .N(N),
-        .OUTPUT_EXPONENT(1'b0)
+        .OUTPUT_EXPONENT(OE)
     ) dut (
         .takum                      (takum),
         .sign_bit                   (sign_bit),

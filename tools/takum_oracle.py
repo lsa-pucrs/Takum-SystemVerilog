@@ -48,10 +48,18 @@ def decode(takum, n, output_exponent):
     # Only the top `regime` bits of the field carry the explicit characteristic.
     c_explicit = 0 if regime == 0 else (char7 >> (7 - regime))
 
-    if direction == output_exponent:
-        coe = -(2 ** (regime + 1)) + 1 + c_explicit
+    # Characteristic c, independent of output_exponent (D=0 -> negative branch).
+    if direction == 0:
+        characteristic = -(2 ** (regime + 1)) + 1 + c_explicit
     else:
-        coe = (2 ** regime) - 1 + c_explicit
+        characteristic = (2 ** regime) - 1 + c_explicit
+
+    # The predecoder's exponent output is the bitwise complement of the
+    # characteristic in 9-bit two's complement, i.e. e = -c-1 (verified to match
+    # the RTL exactly).  NOTE: this is the takum codec's *defined* exponent
+    # output; it is NOT the value-correct base-2 exponent for positive inputs
+    # (see README "Upstream design observations" re: the linear roundtrip).
+    coe = characteristic if output_exponent == 0 else (-characteristic - 1)
 
     precision = 0 if regime >= (n - 5) else (n - regime - 5)
 
@@ -137,8 +145,109 @@ def encode(sign, c, mant, is_zero, is_nar, n):
 
 
 # --------------------------------------------------------------------------
+# Second, *value-based* encoder reference.
+#
+# This one shares no implementation lineage with the postencoder's bit tricks:
+# it knows nothing about regimes, leading-one detection, guard/sticky bits, or
+# bound tables.  It only uses the (independent) decode oracle and the metric
+# "the takum that best approximates the input's barred-logarithmic value."
+#
+# A takum's barred-logarithmic value is ell = characteristic + mantissa
+# fraction.  Scaled by 2^(N-5) it is an exact integer L = c*2^(N-5) + m, so all
+# distances are exact integer comparisons (no float ties).  The correct
+# encoding of (sign, c, m) is the same-sign non-special takum whose L' is
+# nearest to the input L; exact ties round to the even takum LSB.  Saturation
+# falls out for free: an out-of-range input's nearest representable neighbour is
+# the extreme takum.  Cross-checking this against the bit-level encode() (which
+# tracks the VHDL) gives two independent encoders that must agree with the DUT.
+# --------------------------------------------------------------------------
+
+_ELL_CACHE = {}
+
+
+def _ell_table(n):
+    """For width n, return {sign: [(L_value, takum), ...]} over all non-special
+    takums, where L = c*2^(n-5) + mantissa."""
+    if n in _ELL_CACHE:
+        return _ELL_CACHE[n]
+    scale = 1 << (n - 5)
+    table = {0: [], 1: []}
+    for t in range(1 << n):
+        s, c, mant, prec, iz, inar = decode(t, n, 0)
+        if iz or inar:
+            continue
+        table[s].append((c * scale + mant, t))
+    _ELL_CACHE[n] = table
+    return table
+
+
+def encode_value_ref(sign, c, mant, n):
+    """Independent encoder: nearest same-sign takum by barred-logarithmic value,
+    ties to even takum LSB."""
+    scale = 1 << (n - 5)
+    mant &= scale - 1
+    target = c * scale + mant
+    best_d = None
+    best_t = None
+    for (lp, t) in _ell_table(n)[sign]:
+        d = abs(lp - target)
+        if best_d is None or d < best_d or (d == best_d and (t & 1) < (best_t & 1)):
+            best_d = d
+            best_t = t
+    return best_t
+
+
+# --------------------------------------------------------------------------
 # vector generation + self-test
 # --------------------------------------------------------------------------
+
+def codec_log_expected(t, n):
+    """decoder_logarithmic -> encoder_logarithmic faithful composition.
+    This pair IS a true inverse: the result equals the input takum."""
+    s, c, mant, prec, iz, inar = decode(t, n, 0)
+    return encode(s, c, mant, iz, inar, n)
+
+
+def codec_lin_expected(t, n):
+    """decoder_linear -> encoder_linear faithful composition.
+
+    decoder_linear is the predecoder with exponent output (e = -c-1);
+    encoder_linear sets characteristic = e for sign=0, ~e for sign=1, then
+    postencodes.  Because the predecoder emits e = -c-1 unconditionally while
+    encoder_linear only re-inverts for sign=1, this pair is the identity for
+    negative inputs but NOT for positive ones -- an upstream-VHDL property the
+    faithful SV reproduces.  This models that exact behaviour."""
+    s, c, mant, prec, iz, inar = decode(t, n, 0)
+    if iz or inar:
+        return t
+    e = -c - 1
+    if s == 0:
+        char = e
+    else:
+        nb = (~(e & 0x1FF)) & 0x1FF
+        char = nb - 512 if nb & 0x100 else nb
+    return encode(s, char, mant, iz, inar, n)
+
+
+def gen_codec_vectors(n, out):
+    """One line per takum (in order 0..2^n-1): expected_log expected_lin."""
+    with open(out, "w") as f:
+        for t in range(1 << n):
+            f.write(f"{codec_log_expected(t, n):0{n}b} {codec_lin_expected(t, n):0{n}b}\n")
+
+
+def gen_encode_sweep_vectors(n, out):
+    """Independent rounding stress vectors: every (sign, characteristic,
+    mantissa) input, with the expected takum from the value-based reference
+    (encode_value_ref) -- so the encoder is checked on NON-representable inputs
+    against a reference that owes nothing to its bit-level rounding logic."""
+    mw = n - 5
+    with open(out, "w") as f:
+        for s in (0, 1):
+            for c in range(-255, 255):
+                for mant in range(1 << mw):
+                    exp = encode_value_ref(s, c, mant, n)
+                    f.write(f"{s} {c} {mant:0{mw}b} 0 0 {exp:0{n}b}\n")
 
 def gen_decode_vectors(n, output_exponent, out):
     """Emit one line per takum: takum sign coe mant prec is_zero is_nar
@@ -181,9 +290,37 @@ def selftest():
     _, coe, _, _, _, _ = decode(0x01, 8, 0)
     check("N=8 0x01 characteristic", coe, -239)
 
-    print("anchor: encode saturation (underflow path)")
-    check("N=16 s=0,c=-255,m=0 -> 0x0001", encode(0, -255, 0, 0, 0, 16), 0x0001)
-    check("N=16 s=1,c=-255,m=0 -> 0x8001", encode(1, -255, 0, 0, 0, 16), 0x8001)
+    print("anchor: encode saturation (underflow path) -- both references")
+    check("bit   N=16 s=0,c=-255,m=0 -> 0x0001", encode(0, -255, 0, 0, 0, 16), 0x0001)
+    check("bit   N=16 s=1,c=-255,m=0 -> 0x8001", encode(1, -255, 0, 0, 0, 16), 0x8001)
+    check("value N=16 s=0,c=-255,m=0 -> 0x0001", encode_value_ref(0, -255, 0, 16), 0x0001)
+    check("value N=16 s=1,c=-255,m=0 -> 0x8001", encode_value_ref(1, -255, 0, 16), 0x8001)
+
+    # The bit-level encoder tracks the original VHDL; the value-based encoder is
+    # the ideal nearest-representable rounding.  They agree everywhere EXCEPT a
+    # documented corner: at widths where c=-255 is not reachable by any decode
+    # (e.g. N=12), the VHDL's underflow guard only covers crop=0, so a
+    # sub-minimal (c=-255, crop!=0) input is flushed to zero/NaR instead of
+    # rounded up to the minimum.  This is an original-VHDL property the faithful
+    # SV reproduces, not a conversion defect; it is allow-listed here, not hidden.
+    print("triangulation: bit-encoder vs value-encoder over ALL (s,c,m) inputs")
+    for n in (8, 12):
+        mw = n - 5
+        unexpected = 0
+        documented = 0
+        for s in (0, 1):
+            for c in range(-255, 255):
+                for mant in range(1 << mw):
+                    if encode(s, c, mant, 0, 0, n) != encode_value_ref(s, c, mant, n):
+                        # documented original-VHDL subnormal flush corner
+                        if c == -255 and (mant >> 6) != 0:
+                            documented += 1
+                        else:
+                            unexpected += 1
+                            if unexpected <= 5:
+                                print(f"    N={n} UNEXPECTED s={s} c={c} m={mant:0{mw}b}")
+        print(f"    N={n} documented-subnormal divergences: {documented}")
+        check(f"N={n} no UNEXPECTED bit/value divergence", unexpected, 0)
 
     print("roundtrip: decode then encode == identity (all takum, non-special)")
     for n in (8, 12, 16):
@@ -209,6 +346,19 @@ if __name__ == "__main__":
         if kind == "decode":
             oe = int(sys.argv[5]) if len(sys.argv) > 5 else 0
             gen_decode_vectors(n, oe, out)
+        elif kind == "codec":
+            gen_codec_vectors(n, out)
+        elif kind == "encsweep":
+            # every (sign, characteristic, mantissa) input, expected from the
+            # VHDL-faithful bit encoder -- direct rounding-path coverage for the
+            # DUT over non-representable inputs.
+            mw = n - 5
+            with open(out, "w") as f:
+                for s in (0, 1):
+                    for c in range(-255, 255):
+                        for m in range(1 << mw):
+                            e = encode(s, c, m, 0, 0, n)
+                            f.write(f"{s} {c} {m:0{mw}b} 0 0 {e:0{n}b}\n")
         else:
             mw = n - 5
             extra = [
