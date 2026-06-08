@@ -250,7 +250,7 @@ module postencoder #(
             mantissa_bits_crop_one  = {(N-11){1'b1}};
 
             if (mantissa_bits_crop == mantissa_bits_crop_zero) begin
-                if (characteristic == 9'sd255)  // -255 in 9-bit signed (0b100000001)
+                if (characteristic == -9'sd255)  // -255 = 9-bit two's complement 0b100000001
                     round_down_underflows = 1'b1;  // Can't go lower than -255
                 else
                     round_down_underflows = 1'b0;

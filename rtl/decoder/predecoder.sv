@@ -188,13 +188,12 @@ module predecoder #(
             // Full extraction: bits [N-3 : N-12] give us 10 bits
             assign regime_characteristic_segment = takum[N-3 -: 10];
         end else begin : gen_segment_padded
-            // Short takum: take available bits and zero-pad
-            logic [9:0] padded;
-            always_comb begin
-                padded = '0;
-                padded[N-3:0] = takum[N-3:0];
-            end
-            assign regime_characteristic_segment = padded;
+            // Short takum (N<12): the regime+characteristic field is shorter
+            // than 10 bits.  The takum bits are MSB-aligned at the top of the
+            // segment and the missing low bits are ghost zeros, exactly as the
+            // VHDL: takum(n-3 downto 0) & (11-n downto 0 => '0').
+            //   width = (N-2) takum bits + (12-N) zero bits = 10 bits.
+            assign regime_characteristic_segment = { takum[N-3:0], {(12-N){1'b0}} };
         end
     endgenerate
 
